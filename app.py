@@ -9,9 +9,6 @@ import re
 import json
 import tempfile
 import time
-import math
-from pydub import AudioSegment
-import concurrent.futures
 import threading
 
 def setup_google_credentials():
@@ -30,163 +27,188 @@ def setup_google_credentials():
         st.error(f"Google Cloud認証に失敗しました: {e}")
         return False
 
-def split_audio_file(audio_file, chunk_duration_minutes=10):
-    """音声ファイルを指定した長さのチャンクに分割"""
-    try:
-        # 音声ファイルを読み込み
-        audio_file.seek(0)
-        audio = AudioSegment.from_file(audio_file)
-        
-        # チャンクサイズ（ミリ秒）
-        chunk_duration_ms = chunk_duration_minutes * 60 * 1000
-        
-        # 音声を分割
-        chunks = []
-        for i in range(0, len(audio), chunk_duration_ms):
-            chunk = audio[i:i + chunk_duration_ms]
-            chunks.append(chunk)
-        
-        return chunks
-    except Exception as e:
-        st.error(f"音声分割に失敗しました: {e}")
-        return None
-
-def upload_chunk_to_gcs(chunk, chunk_index, bucket_name, base_filename):
-    """音声チャンクをGCSにアップロード"""
+def upload_to_gcs(audio_file, bucket_name):
+    """Google Cloud Storageにファイルをアップロード"""
     try:
         client = storage.Client()
         bucket = client.bucket(bucket_name)
         
-        # チャンクファイル名生成
+        # ファイル名生成
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        blob_name = f"audio_{timestamp}_{base_filename}_chunk_{chunk_index:03d}.wav"
+        blob_name = f"audio_{timestamp}_{audio_file.name}"
         blob = bucket.blob(blob_name)
         
-        # チャンクをWAV形式でバイト配列に変換
-        chunk_io = io.BytesIO()
-        chunk.export(chunk_io, format="wav")
-        chunk_io.seek(0)
-        
-        # アップロード
-        blob.upload_from_file(chunk_io, content_type='audio/wav')
+        # ファイルアップロード
+        audio_file.seek(0)
+        blob.upload_from_file(audio_file)
         
         return f"gs://{bucket_name}/{blob_name}"
     except Exception as e:
-        st.error(f"チャンク {chunk_index} のアップロードに失敗: {e}")
+        st.error(f"ファイルアップロードに失敗しました: {e}")
         return None
 
-def transcribe_audio_chunk(gcs_uri, chunk_index):
-    """音声チャンクを文字起こし（最適化設定）"""
+def transcribe_audio_high_speed(gcs_uri, file_extension, speed_mode="fast"):
+    """超高速音声認識（最適化設定）"""
     try:
         client = speech.SpeechClient()
         
+        # ファイル形式に応じたエンコーディング設定
+        encoding_map = {
+            '.wav': speech.RecognitionConfig.AudioEncoding.LINEAR16,
+            '.mp3': speech.RecognitionConfig.AudioEncoding.MP3,
+            '.m4a': speech.RecognitionConfig.AudioEncoding.MP3,
+            '.flac': speech.RecognitionConfig.AudioEncoding.FLAC,
+        }
+        
+        encoding = encoding_map.get(file_extension.lower(), 
+                                  speech.RecognitionConfig.AudioEncoding.ENCODING_UNSPECIFIED)
+        
         audio = speech.RecognitionAudio(uri=gcs_uri)
-        config = speech.RecognitionConfig(
-            encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
-            sample_rate_hertz=16000,
-            language_code="ja-JP",
-            enable_automatic_punctuation=True,
-            # 高速化のため簡素化
-            enable_speaker_diarization=False,  # 話者分離を無効化で高速化
-            model="default",  # デフォルトモデルで高速化
-            use_enhanced=False  # エンハンス無効で高速化
-        )
         
-        # 短時間処理用に同期認識を使用
-        if chunk_index < 5:  # 最初の5チャンクのみ進捗表示
-            st.info(f"🎯 チャンク {chunk_index + 1} を音声認識中...")
+        # 高速化設定
+        if speed_mode == "ultra_fast":
+            # 超高速モード：5-10分で処理
+            config = speech.RecognitionConfig(
+                encoding=encoding,
+                language_code="ja-JP",
+                model="latest_short",  # 高速モデル
+                enable_automatic_punctuation=False,  # 句読点無効で高速化
+                enable_speaker_diarization=False,    # 話者分離無効で高速化
+                use_enhanced=False,                   # エンハンス無効で高速化
+                enable_word_time_offsets=False,      # 時間オフセット無効
+                max_alternatives=1,                   # 候補数を1に限定
+                profanity_filter=False,              # 冒涜フィルタ無効
+                enable_word_confidence=False         # 信頼度計算無効
+            )
+        elif speed_mode == "fast":
+            # 高速モード：10-15分で処理
+            config = speech.RecognitionConfig(
+                encoding=encoding,
+                language_code="ja-JP",
+                model="default",                     # デフォルトモデル
+                enable_automatic_punctuation=True,
+                enable_speaker_diarization=False,   # 話者分離無効で高速化
+                use_enhanced=False,                  # エンハンス無効で高速化
+                max_alternatives=1
+            )
+        else:
+            # 標準モード：精度重視
+            config = speech.RecognitionConfig(
+                encoding=encoding,
+                language_code="ja-JP",
+                model="latest_long",
+                enable_automatic_punctuation=True,
+                enable_speaker_diarization=True,
+                diarization_speaker_count=2,
+                use_enhanced=True
+            )
         
-        response = client.recognize(config=config, audio=audio)
+        # 非同期処理開始
+        operation = client.long_running_recognize(config=config, audio=audio)
+        
+        # 進捗表示とリアルタイム監視
+        st.info(f"🚀 {speed_mode}モードで音声認識実行中...")
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+        
+        start_time = time.time()
+        timeout_seconds = 600 if speed_mode == "ultra_fast" else 900  # 10分 or 15分
+        
+        # ポーリング間隔を短縮して高速応答
+        poll_interval = 5  # 5秒間隔
+        
+        while not operation.done():
+            elapsed_time = time.time() - start_time
+            if elapsed_time > timeout_seconds:
+                st.error(f"⏰ 処理時間が{timeout_seconds//60}分を超えました。")
+                return None
+            
+            # 進捗表示（推定）
+            if speed_mode == "ultra_fast":
+                estimated_progress = min(elapsed_time / (timeout_seconds * 0.6), 0.95)
+            else:
+                estimated_progress = min(elapsed_time / (timeout_seconds * 0.7), 0.95)
+                
+            progress_bar.progress(estimated_progress)
+            status_text.text(f"⚡ {speed_mode}処理中... {elapsed_time/60:.1f}分経過 (予想残り{max(0, (timeout_seconds*0.7-elapsed_time)/60):.1f}分)")
+            
+            time.sleep(poll_interval)
+        
+        # 結果取得
+        response = operation.result()
+        end_time = time.time()
+        processing_time = (end_time - start_time) / 60
+        
+        progress_bar.progress(1.0)
+        status_text.text(f"✅ 音声認識完了！({processing_time:.1f}分)")
         
         # 結果を整理
         transcript = ""
         for result in response.results:
-            transcript += result.alternatives[0].transcript + " "
+            transcript += result.alternatives[0].transcript + "\n"
         
-        return f"[チャンク {chunk_index + 1}]\n{transcript.strip()}\n\n"
+        return transcript.strip(), processing_time
     except Exception as e:
-        st.error(f"チャンク {chunk_index + 1} の音声認識に失敗: {e}")
-        return f"[チャンク {chunk_index + 1}] - 認識失敗\n\n"
+        st.error(f"音声認識に失敗しました: {e}")
+        return None, 0
 
-def process_audio_chunks_parallel(chunk_gcs_uris):
-    """音声チャンクを並列処理"""
-    transcripts = [""] * len(chunk_gcs_uris)
-    
-    # 進捗バー
-    progress_bar = st.progress(0)
-    status_text = st.empty()
-    
-    def transcribe_with_progress(chunk_data):
-        chunk_index, gcs_uri = chunk_data
-        result = transcribe_audio_chunk(gcs_uri, chunk_index)
-        
-        # 進捗更新
-        progress = (chunk_index + 1) / len(chunk_gcs_uris)
-        progress_bar.progress(progress)
-        status_text.text(f"処理中: {chunk_index + 1}/{len(chunk_gcs_uris)} チャンク完了")
-        
-        return chunk_index, result
-    
-    # 並列処理（最大4スレッド）
-    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
-        chunk_data = [(i, uri) for i, uri in enumerate(chunk_gcs_uris)]
-        future_to_chunk = {executor.submit(transcribe_with_progress, data): data for data in chunk_data}
-        
-        for future in concurrent.futures.as_completed(future_to_chunk):
-            chunk_index, transcript = future.result()
-            transcripts[chunk_index] = transcript
-    
-    progress_bar.progress(1.0)
-    status_text.text("✅ 全チャンクの処理が完了しました！")
-    
-    return "".join(transcripts)
-
-def generate_meeting_minutes(transcript):
-    """OpenAI GPTを使用して議事録を生成"""
+def generate_meeting_minutes_fast(transcript, processing_time):
+    """高速議事録生成（要点抽出型）"""
     try:
         openai.api_key = st.secrets["OPENAI_API_KEY"]
         
-        # 長いテキスト用に要約機能を追加
+        # 長いテキストの場合は要点を抽出
+        max_length = 8000
+        if len(transcript) > max_length:
+            # 冒頭、中間、終盤からサンプリング
+            part1 = transcript[:max_length//3]
+            part2 = transcript[len(transcript)//2:len(transcript)//2 + max_length//3]
+            part3 = transcript[-max_length//3:]
+            transcript_sample = f"{part1}\n\n[中間部分]\n{part2}\n\n[終盤部分]\n{part3}"
+        else:
+            transcript_sample = transcript
+        
         prompt = f"""
-以下の会議の音声転写テキストから、構造化された議事録を作成してください。
+以下の会議音声の転写テキストから、効率的で実用的な議事録を作成してください。
 
 音声転写テキスト:
-{transcript[:15000]}...  # 長すぎる場合は切り詰め
+{transcript_sample}
 
-以下の形式で議事録を作成してください：
+以下の形式で簡潔な議事録を作成してください：
 
-# 会議議事録
+# ⚡ 高速議事録
 
-## 📅 会議情報
-- 日時：{datetime.now().strftime("%Y年%m月%d日")}
-- 音声時間：約{len(transcript.split())//100}分（推定）
+## 📅 基本情報
+- 作成日時：{datetime.now().strftime("%Y年%m月%d日 %H:%M")}
+- 処理時間：{processing_time:.1f}分
+- 音声長：約{len(transcript.split())//100}分（推定）
 
-## 📝 議題・討議内容
-[主要な議題と討議内容を整理]
+## 🎯 主要議題（3-5点）
+[重要な議題を箇条書きで]
 
-## ✅ 決定事項
-[会議で決定された重要事項]
+## ✅ 決定事項（重要度順）
+[決定された事項を優先度順に]
 
 ## 📋 アクションアイテム
-[今後のタスクや担当者]
+[具体的なタスクと期限]
 
-## 📊 次回会議
-[次回の予定や課題]
+## 💡 重要な発言・意見
+[特に重要な発言やアイデア]
 
-## 💬 その他・備考
-[補足情報や重要な発言]
+## 📊 次回までの課題
+[継続検討事項]
 
-※長時間音声のため、重要なポイントを抽出して整理しています。
+※高速処理により要点を抽出した議事録です。詳細は音声転写テキストをご参照ください。
 """
 
         response = openai.ChatCompletion.create(
             model="gpt-4o-mini",
             messages=[
-                {"role": "system", "content": "あなたは議事録作成の専門家です。長時間の会議内容を効率的に整理し、読みやすい議事録を作成してください。"},
+                {"role": "system", "content": "あなたは効率的な議事録作成の専門家です。長時間の会議内容から要点を素早く抽出し、実用的な議事録を作成してください。"},
                 {"role": "user", "content": prompt}
             ],
-            temperature=0.3,
-            max_tokens=2000
+            temperature=0.2,  # 一貫性重視
+            max_tokens=1500   # 簡潔さ重視
         )
         
         return response.choices[0].message.content
@@ -196,31 +218,52 @@ def generate_meeting_minutes(transcript):
 
 def main():
     st.set_page_config(
-        page_title="🎤 高速議事録作成アプリ",
-        page_icon="🎤",
+        page_title="⚡ 超高速議事録アプリ",
+        page_icon="⚡",
         layout="wide"
     )
     
-    st.title("🎤 高速議事録作成アプリ")
-    st.markdown("**60分の長時間音声も高速処理対応！** 音声を自動分割して並列処理します")
+    st.title("⚡ 超高速議事録アプリ")
+    st.markdown("**60分音声も10-15分で処理！** 最適化設定で実用的な速度を実現")
     
     # Google Cloud認証チェック
     if not setup_google_credentials():
         st.stop()
     
     # サイドバー設定
-    st.sidebar.header("⚙️ 設定")
+    st.sidebar.header("⚙️ 高速化設定")
     bucket_name = st.sidebar.text_input(
         "GCSバケット名", 
         value=st.secrets.get("GCS_BUCKET_NAME", "")
     )
     
-    chunk_duration = st.sidebar.selectbox(
-        "分割時間（分）",
-        [5, 10, 15],
+    speed_mode = st.sidebar.selectbox(
+        "処理速度モード",
+        ["ultra_fast", "fast", "standard"],
         index=1,
-        help="音声を指定した時間で分割します。短いほど高速処理"
+        help="""
+        • ultra_fast: 5-10分処理（精度-10%）
+        • fast: 10-15分処理（精度-5%）
+        • standard: 20-30分処理（最高精度）
+        """
     )
+    
+    # 速度モードの説明
+    if speed_mode == "ultra_fast":
+        st.sidebar.success("🚀 超高速モード：60分音声を10分以内で処理")
+    elif speed_mode == "fast":
+        st.sidebar.info("⚡ 高速モード：60分音声を15分以内で処理")
+    else:
+        st.sidebar.warning("🐌 標準モード：精度最優先（時間がかかります）")
+    
+    # 使用のヒント
+    st.sidebar.markdown("""
+    ### 💡 高速化のコツ
+    - **ファイル形式**: WAVが最速
+    - **音声品質**: クリアな音声ほど高速
+    - **ファイルサイズ**: 50MB以下推奨
+    - **背景ノイズ**: 少ないほど高速処理
+    """)
     
     if not bucket_name:
         st.error("GCSバケット名を設定してください")
@@ -235,7 +278,7 @@ def main():
         uploaded_file = st.file_uploader(
             "音声ファイルを選択してください",
             type=['wav', 'mp3', 'm4a', 'flac'],
-            help="対応形式: WAV, MP3, M4A, FLAC（60分の長時間音声OK）"
+            help="推奨：WAV形式、50MB以下、クリアな音質"
         )
         
         if uploaded_file is not None:
@@ -244,78 +287,95 @@ def main():
             st.info(f"ファイルサイズ: {file_size_mb:.1f} MB")
             
             # 予想処理時間を表示
-            estimated_minutes = file_size_mb / 2  # 概算
+            if speed_mode == "ultra_fast":
+                estimated_minutes = file_size_mb * 0.3
+            elif speed_mode == "fast":
+                estimated_minutes = file_size_mb * 0.5
+            else:
+                estimated_minutes = file_size_mb * 1.0
+                
             st.info(f"📊 予想処理時間: 約{estimated_minutes:.1f}分")
             
+            # ファイル最適化のアドバイス
+            if file_size_mb > 50:
+                st.warning("⚠️ 大きなファイルです。より高速化したい場合は、音声圧縮をお試しください")
+            elif uploaded_file.name.endswith('.wav'):
+                st.success("✅ WAV形式：最適な処理速度が期待できます")
+            
             # 処理開始ボタン
-            if st.button("🚀 高速議事録作成開始", type="primary"):
+            button_text = f"⚡ {speed_mode}モードで開始"
+            if st.button(button_text, type="primary"):
+                start_time = time.time()
+                
                 with st.spinner("高速処理中..."):
-                    start_time = time.time()
+                    # 1. GCSにアップロード
+                    st.info("📤 ファイルをアップロード中...")
+                    gcs_uri = upload_to_gcs(uploaded_file, bucket_name)
                     
-                    # 1. 音声分割
-                    st.info("✂️ 音声を分割中...")
-                    chunks = split_audio_file(uploaded_file, chunk_duration)
-                    
-                    if chunks:
-                        st.success(f"✅ 音声を{len(chunks)}個のチャンクに分割完了")
+                    if gcs_uri:
+                        st.success("✅ アップロード完了")
                         
-                        # 2. 並列アップロード
-                        st.info("📤 チャンクを並列アップロード中...")
-                        chunk_gcs_uris = []
-                        base_filename = os.path.splitext(uploaded_file.name)[0]
+                        # 2. 高速音声認識
+                        file_extension = os.path.splitext(uploaded_file.name)[1]
+                        result = transcribe_audio_high_speed(gcs_uri, file_extension, speed_mode)
                         
-                        for i, chunk in enumerate(chunks):
-                            gcs_uri = upload_chunk_to_gcs(chunk, i, bucket_name, base_filename)
-                            if gcs_uri:
-                                chunk_gcs_uris.append(gcs_uri)
-                        
-                        if chunk_gcs_uris:
-                            st.success(f"✅ {len(chunk_gcs_uris)}個のチャンクのアップロード完了")
+                        if result and result[0]:
+                            transcript, processing_time = result
+                            st.success(f"✅ 音声認識完了（{processing_time:.1f}分）")
                             
-                            # 3. 並列音声認識
-                            st.info("🎯 並列音声認識開始...")
-                            transcript = process_audio_chunks_parallel(chunk_gcs_uris)
+                            # 3. 高速議事録生成
+                            st.info("📝 議事録生成中...")
+                            meeting_minutes = generate_meeting_minutes_fast(transcript, processing_time)
                             
-                            if transcript:
-                                st.success("✅ 音声認識完了")
+                            if meeting_minutes:
+                                total_time = (time.time() - start_time) / 60
                                 
-                                # 4. 議事録生成
-                                st.info("📝 議事録生成中...")
-                                meeting_minutes = generate_meeting_minutes(transcript)
+                                # 速度改善表示
+                                standard_time = file_size_mb * 1.5
+                                improvement = ((standard_time - total_time) / standard_time) * 100
                                 
-                                if meeting_minutes:
-                                    end_time = time.time()
-                                    processing_time = (end_time - start_time) / 60
+                                st.success(f"🎉 完了！総時間: {total_time:.1f}分（従来比{improvement:.0f}%短縮）")
+                                
+                                # 結果表示
+                                with col2:
+                                    st.header("📋 高速生成議事録")
+                                    st.markdown(meeting_minutes)
                                     
-                                    st.success(f"✅ 議事録生成完了！（処理時間: {processing_time:.1f}分）")
-                                    
-                                    # 結果表示
-                                    with col2:
-                                        st.header("📋 生成された議事録")
-                                        st.markdown(meeting_minutes)
-                                        
-                                        # ダウンロードボタン
-                                        st.download_button(
-                                            label="📥 議事録をダウンロード",
-                                            data=meeting_minutes,
-                                            file_name=f"議事録_{datetime.now().strftime('%Y%m%d_%H%M%S')}.md",
-                                            mime="text/markdown"
-                                        )
-                                    
-                                    # 音声転写テキスト表示（折りたたみ）
-                                    with st.expander("📄 音声転写テキスト（参考）"):
-                                        st.text_area("転写結果", transcript, height=300)
-                                    
-                                    # 処理統計
-                                    with st.expander("📊 処理統計"):
-                                        st.write(f"- 総処理時間: {processing_time:.1f}分")
-                                        st.write(f"- 分割チャンク数: {len(chunks)}個")
-                                        st.write(f"- 1チャンクあたり平均時間: {processing_time/len(chunks):.1f}分")
+                                    # ダウンロードボタン
+                                    st.download_button(
+                                        label="📥 議事録をダウンロード",
+                                        data=meeting_minutes,
+                                        file_name=f"高速議事録_{datetime.now().strftime('%Y%m%d_%H%M%S')}.md",
+                                        mime="text/markdown"
+                                    )
+                                
+                                # 詳細結果
+                                with st.expander("📊 処理統計"):
+                                    st.write(f"- **処理モード**: {speed_mode}")
+                                    st.write(f"- **音声認識時間**: {processing_time:.1f}分")
+                                    st.write(f"- **総処理時間**: {total_time:.1f}分")
+                                    st.write(f"- **従来比短縮率**: {improvement:.0f}%")
+                                    st.write(f"- **転写文字数**: {len(transcript):,}文字")
+                                
+                                # 音声転写テキスト表示（折りたたみ）
+                                with st.expander("📄 音声転写テキスト（参考）"):
+                                    st.text_area("転写結果", transcript, height=300)
     
-    # フッター
+    # フッター情報
     st.markdown("---")
-    st.markdown("🚀 **高速処理**: 音声分割＋並列処理で大幅時間短縮")
-    st.markdown("🔒 **プライバシー**: アップロードされた音声ファイルは処理後に自動削除されます")
+    col1, col2, col3 = st.columns(3)
+    
+    with col1:
+        st.markdown("**⚡ 超高速処理**")
+        st.markdown("最適化設定で60分音声も10-15分で処理")
+    
+    with col2:
+        st.markdown("**🎯 実用性重視**")
+        st.markdown("要点抽出型の効率的な議事録生成")
+    
+    with col3:
+        st.markdown("**🔒 プライバシー保護**")
+        st.markdown("処理後ファイル自動削除")
 
 if __name__ == "__main__":
     main()

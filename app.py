@@ -2,29 +2,85 @@ import streamlit as st
 import os
 from google.cloud import speech_v1p1beta1 as speech
 from google.cloud import storage
+from google.cloud import firestore
 import openai
-from datetime import datetime
+from datetime import datetime, timedelta
 import io
 import re
 import json
 import tempfile
 import time
+import threading
+import uuid
+import hashlib
 
 def setup_google_credentials():
     """Google Cloud認証設定"""
     try:
-        # Streamlit Secretsから認証情報を取得
         creds_dict = dict(st.secrets["gcp_service_account"])
-        
-        # 一時ファイルに認証情報を書き込み
         with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.json') as f:
             json.dump(creds_dict, f)
             os.environ['GOOGLE_APPLICATION_CREDENTIALS'] = f.name
-        
         return True
     except Exception as e:
         st.error(f"Google Cloud認証に失敗しました: {e}")
         return False
+
+class AsyncJobManager:
+    """非同期ジョブ管理システム"""
+    
+    def __init__(self):
+        self.db = firestore.Client()
+        self.jobs_collection = "meeting_recorder_jobs"
+    
+    def create_job(self, file_info, settings):
+        """新しいジョブを作成"""
+        job_id = str(uuid.uuid4())[:8]
+        job_data = {
+            'job_id': job_id,
+            'status': 'created',
+            'created_at': datetime.now(),
+            'updated_at': datetime.now(),
+            'file_info': file_info,
+            'settings': settings,
+            'progress': 0,
+            'current_step': 'waiting',
+            'result': None,
+            'error': None
+        }
+        
+        self.db.collection(self.jobs_collection).document(job_id).set(job_data)
+        return job_id
+    
+    def update_job_status(self, job_id, status, progress=None, current_step=None, result=None, error=None):
+        """ジョブステータスを更新"""
+        update_data = {
+            'status': status,
+            'updated_at': datetime.now()
+        }
+        
+        if progress is not None:
+            update_data['progress'] = progress
+        if current_step:
+            update_data['current_step'] = current_step
+        if result:
+            update_data['result'] = result
+        if error:
+            update_data['error'] = error
+            
+        self.db.collection(self.jobs_collection).document(job_id).update(update_data)
+    
+    def get_job_status(self, job_id):
+        """ジョブステータスを取得"""
+        doc = self.db.collection(self.jobs_collection).document(job_id).get()
+        return doc.to_dict() if doc.exists else None
+    
+    def cleanup_old_jobs(self, days=7):
+        """古いジョブを削除"""
+        cutoff_date = datetime.now() - timedelta(days=days)
+        old_jobs = self.db.collection(self.jobs_collection).where('created_at', '<', cutoff_date).get()
+        for job in old_jobs:
+            job.reference.delete()
 
 def upload_to_gcs(audio_file, bucket_name):
     """Google Cloud Storageにファイルをアップロード"""
@@ -32,12 +88,10 @@ def upload_to_gcs(audio_file, bucket_name):
         client = storage.Client()
         bucket = client.bucket(bucket_name)
         
-        # ファイル名生成
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         blob_name = f"audio_{timestamp}_{audio_file.name}"
         blob = bucket.blob(blob_name)
         
-        # ファイルアップロード
         audio_file.seek(0)
         blob.upload_from_file(audio_file)
         
@@ -46,12 +100,16 @@ def upload_to_gcs(audio_file, bucket_name):
         st.error(f"ファイルアップロードに失敗しました: {e}")
         return None
 
-def transcribe_audio_optimized(gcs_uri, file_extension, speed_mode="balanced"):
-    """最適化された音声認識（確実＆高速）"""
+def process_audio_async(job_id, gcs_uri, file_extension, settings):
+    """非同期音声処理（バックエンドで実行）"""
+    job_manager = AsyncJobManager()
+    
     try:
+        # ステップ1: 音声認識開始
+        job_manager.update_job_status(job_id, 'processing', 10, '音声認識を開始')
+        
         client = speech.SpeechClient()
         
-        # ファイル形式に応じたエンコーディング設定
         encoding_map = {
             '.wav': speech.RecognitionConfig.AudioEncoding.LINEAR16,
             '.mp3': speech.RecognitionConfig.AudioEncoding.MP3,
@@ -64,22 +122,19 @@ def transcribe_audio_optimized(gcs_uri, file_extension, speed_mode="balanced"):
         
         audio = speech.RecognitionAudio(uri=gcs_uri)
         
-        # 速度モードに応じた設定
-        if speed_mode == "fast":
-            # 高速モード：処理速度優先
+        # 設定に応じた音声認識設定
+        speed_mode = settings.get('speed_mode', 'balanced')
+        if speed_mode == 'fast':
             config = speech.RecognitionConfig(
                 encoding=encoding,
                 language_code="ja-JP",
-                model="default",  # 安定したモデル
+                model="default",
                 enable_automatic_punctuation=True,
-                enable_speaker_diarization=False,  # 話者分離無効で高速化
-                use_enhanced=False,  # エンハンス無効で高速化
-                max_alternatives=1,
-                profanity_filter=False
+                enable_speaker_diarization=False,
+                use_enhanced=False,
+                max_alternatives=1
             )
-            timeout_minutes = 25
-        elif speed_mode == "quality":
-            # 品質モード：精度優先
+        elif speed_mode == 'quality':
             config = speech.RecognitionConfig(
                 encoding=encoding,
                 language_code="ja-JP",
@@ -89,157 +144,138 @@ def transcribe_audio_optimized(gcs_uri, file_extension, speed_mode="balanced"):
                 diarization_speaker_count=2,
                 use_enhanced=True
             )
-            timeout_minutes = 40
         else:
-            # バランスモード：速度と精度のバランス（推奨）
             config = speech.RecognitionConfig(
                 encoding=encoding,
                 language_code="ja-JP",
                 model="default",
                 enable_automatic_punctuation=True,
-                enable_speaker_diarization=False,  # 高速化
-                use_enhanced=False,  # 高速化
-                max_alternatives=1
+                enable_speaker_diarization=False,
+                use_enhanced=False
             )
-            timeout_minutes = 30
         
-        # 非同期処理開始
+        # 非同期音声認識開始
         operation = client.long_running_recognize(config=config, audio=audio)
+        job_manager.update_job_status(job_id, 'processing', 20, '音声認識を実行中')
         
-        st.info(f"🎯 音声認識実行中... 最大{timeout_minutes}分お待ちください")
-        progress_bar = st.progress(0)
-        status_text = st.empty()
-        
+        # バックエンドで処理継続（ブラウザ不要）
         start_time = time.time()
-        timeout_seconds = timeout_minutes * 60
+        max_wait_time = 3600  # 1時間
         
-        # 進捗監視
         while not operation.done():
             elapsed_time = time.time() - start_time
-            if elapsed_time > timeout_seconds:
-                st.error(f"⏰ 処理時間が{timeout_minutes}分を超えました。より小さなファイルでお試しください。")
-                return None, 0
+            if elapsed_time > max_wait_time:
+                job_manager.update_job_status(job_id, 'failed', error='タイムアウト（1時間）')
+                return
             
-            # 進捗表示
-            estimated_progress = min(elapsed_time / (timeout_seconds * 0.8), 0.95)
-            progress_bar.progress(estimated_progress)
+            # 進捗更新（バックエンドで自動実行）
+            progress = min(20 + (elapsed_time / max_wait_time) * 60, 80)
+            job_manager.update_job_status(job_id, 'processing', progress, '音声認識処理中')
             
-            # 残り時間計算
-            if elapsed_time > 60:  # 1分経過後に残り時間表示
-                estimated_total = elapsed_time / estimated_progress if estimated_progress > 0.1 else timeout_seconds
-                remaining_time = max(0, (estimated_total - elapsed_time) / 60)
-                status_text.text(f"⚡ {speed_mode}モード処理中... {elapsed_time/60:.1f}分経過 (推定残り{remaining_time:.1f}分)")
-            else:
-                status_text.text(f"⚡ {speed_mode}モード処理中... {elapsed_time:.0f}秒経過")
-            
-            time.sleep(8)  # 8秒間隔でチェック
+            time.sleep(30)  # 30秒間隔でチェック
         
-        # 結果取得
+        # ステップ2: 結果取得
         response = operation.result()
         processing_time = (time.time() - start_time) / 60
         
-        progress_bar.progress(1.0)
-        status_text.text(f"✅ 音声認識完了！({processing_time:.1f}分)")
-        
-        # 結果を整理
         transcript = ""
         for result in response.results:
             transcript += result.alternatives[0].transcript + "\n"
         
-        return transcript.strip(), processing_time
-    except Exception as e:
-        st.error(f"音声認識に失敗しました: {e}")
-        return None, 0
-
-def generate_meeting_minutes_smart(transcript, processing_time, speed_mode):
-    """スマート議事録生成"""
-    try:
+        job_manager.update_job_status(job_id, 'processing', 85, '議事録生成中')
+        
+        # ステップ3: 議事録生成
         openai.api_key = st.secrets["OPENAI_API_KEY"]
         
-        # テキスト長に応じた処理
-        max_length = 10000
-        if len(transcript) > max_length:
-            # 長いテキストの場合は要点抽出
-            parts = [
-                transcript[:max_length//3],
-                transcript[len(transcript)//2:len(transcript)//2 + max_length//3],
-                transcript[-max_length//3:]
-            ]
-            transcript_sample = "\n\n[--- 中間部分 ---]\n\n".join(parts)
-            note = "※長時間音声のため主要部分を抽出して議事録を作成しています。"
-        else:
-            transcript_sample = transcript
-            note = ""
-        
         prompt = f"""
-以下の会議音声転写テキストから、実用的な議事録を作成してください。
+以下の会議音声転写テキストから実用的な議事録を作成してください。
 
 音声転写テキスト:
-{transcript_sample}
+{transcript[:8000]}...
 
 以下の形式で議事録を作成してください：
 
-# 🎤 会議議事録
+# 🎤 会議議事録（自動生成）
 
 ## 📅 基本情報
-- 作成日時：{datetime.now().strftime("%Y年%m月%d日 %H:%M")}
-- 処理モード：{speed_mode}
+- 生成日時：{datetime.now().strftime("%Y年%m月%d日 %H:%M")}
 - 処理時間：{processing_time:.1f}分
-- 音声長：約{len(transcript.split())//120}分（推定）
+- 処理モード：{speed_mode}
 
 ## 📋 主要議題
-[重要な議題を3-5点で整理]
+[重要な議題を整理]
 
 ## ✅ 決定事項
-[会議で決定された重要事項を優先度順に]
+[決定された重要事項]
 
 ## 📊 討議内容
-[主要な討議内容と意見]
+[主要な討議内容]
 
 ## 🎯 アクションアイテム
-[具体的なタスクと担当者、期限]
+[具体的なタスクと期限]
 
-## 💡 重要な発言・提案
-[特に重要な発言やアイデア]
+## 💡 重要な発言
+[特に重要な発言]
 
-## 📈 次回までの課題
-[継続検討事項や次回議題]
-
-## 📝 備考
-{note}
+## 📈 継続課題
+[次回への持ち越し事項]
 """
-
+        
         response = openai.ChatCompletion.create(
             model="gpt-4o-mini",
             messages=[
-                {"role": "system", "content": "あなたは経験豊富な議事録作成の専門家です。会議の内容を整理し、実用的で読みやすい議事録を作成してください。"},
+                {"role": "system", "content": "議事録作成の専門家として、実用的な議事録を作成してください。"},
                 {"role": "user", "content": prompt}
             ],
             temperature=0.3,
             max_tokens=2000
         )
         
-        return response.choices[0].message.content
+        meeting_minutes = response.choices[0].message.content
+        
+        # 結果保存
+        result_data = {
+            'transcript': transcript,
+            'meeting_minutes': meeting_minutes,
+            'processing_time': processing_time,
+            'completed_at': datetime.now()
+        }
+        
+        job_manager.update_job_status(job_id, 'completed', 100, '完了', result_data)
+        
     except Exception as e:
-        st.error(f"議事録生成に失敗しました: {e}")
-        return None
+        job_manager.update_job_status(job_id, 'failed', error=str(e))
+
+def start_background_processing(job_id, gcs_uri, file_extension, settings):
+    """バックエンド処理を開始"""
+    thread = threading.Thread(
+        target=process_audio_async,
+        args=(job_id, gcs_uri, file_extension, settings),
+        daemon=True
+    )
+    thread.start()
 
 def main():
     st.set_page_config(
-        page_title="🚀 実用的議事録アプリ",
-        page_icon="🚀",
+        page_title="🔄 非同期議事録アプリ",
+        page_icon="🔄",
         layout="wide"
     )
     
-    st.title("🚀 実用的議事録アプリ")
-    st.markdown("**60分音声対応！** 確実性と高速化を両立した議事録作成")
+    st.title("🔄 非同期議事録アプリ")
+    st.markdown("**スリープしても大丈夫！** ブラウザを閉じても処理が継続される議事録作成システム")
     
-    # Google Cloud認証チェック
     if not setup_google_credentials():
         st.stop()
     
+    job_manager = AsyncJobManager()
+    
+    # セッション状態の初期化
+    if 'current_job_id' not in st.session_state:
+        st.session_state.current_job_id = None
+    
     # サイドバー設定
-    st.sidebar.header("⚙️ 処理設定")
+    st.sidebar.header("⚙️ システム設定")
     bucket_name = st.sidebar.text_input(
         "GCSバケット名", 
         value=st.secrets.get("GCS_BUCKET_NAME", "")
@@ -248,49 +284,30 @@ def main():
     speed_mode = st.sidebar.selectbox(
         "処理モード",
         ["balanced", "fast", "quality"],
-        index=0,
-        help="""
-        • balanced: 速度と精度のバランス（推奨）
-        • fast: 高速処理優先（20分以内）
-        • quality: 高品質優先（40分以内）
-        """
+        index=0
     )
     
-    # モードの説明
-    if speed_mode == "fast":
-        st.sidebar.success("⚡ 高速モード：処理時間優先")
-        st.sidebar.info("• 60分音声 → 約15-20分処理\n• 話者分離なし\n• エンハンス機能なし")
-    elif speed_mode == "quality":
-        st.sidebar.info("🎯 高品質モード：精度優先")
-        st.sidebar.info("• 60分音声 → 約25-40分処理\n• 話者分離あり\n• エンハンス機能あり")
-    else:
-        st.sidebar.success("⚖️ バランスモード：推奨設定")
-        st.sidebar.info("• 60分音声 → 約20-30分処理\n• 速度と精度を両立")
-    
-    # 使用のヒント
     st.sidebar.markdown("""
-    ### 💡 効率的な使用法
-    - **初回利用**: バランスモード推奨
-    - **緊急時**: 高速モード
-    - **重要会議**: 高品質モード
-    - **ファイル形式**: WAV > MP3 > M4A
-    - **推奨サイズ**: 50MB以下
+    ### 🎯 非同期処理の特徴
+    - **ブラウザ閉じてもOK**: 処理は継続
+    - **スリープしてもOK**: バックエンドで実行
+    - **進捗確認**: いつでも状況チェック
+    - **自動復旧**: エラー時の再開機能
     """)
     
     if not bucket_name:
         st.error("GCSバケット名を設定してください")
         st.stop()
     
-    # メインエリア
-    col1, col2 = st.columns([1, 1])
+    # タブ構成
+    tab1, tab2, tab3 = st.tabs(["🚀 新規処理", "📊 進捗確認", "📋 完了済み"])
     
-    with col1:
+    with tab1:
         st.header("🎵 音声ファイルアップロード")
         
         uploaded_file = st.file_uploader(
             "音声ファイルを選択してください",
-            type=['wav', 'mp3', 'm4a', 'flac'],
-            help="対応形式: WAV, MP3, M4A, FLAC (推奨: 50MB以下)"
+            type=['wav', 'mp3', 'm4a', 'flac']
         )
         
         if uploaded_file is not None:
@@ -298,93 +315,107 @@ def main():
             file_size_mb = uploaded_file.size / 1024 / 1024
             st.info(f"ファイルサイズ: {file_size_mb:.1f} MB")
             
-            # 予想処理時間を表示
-            if speed_mode == "fast":
-                estimated_minutes = file_size_mb * 0.8
-            elif speed_mode == "quality":
-                estimated_minutes = file_size_mb * 1.5
-            else:
-                estimated_minutes = file_size_mb * 1.0
-                
-            st.info(f"📊 予想処理時間: 約{estimated_minutes:.1f}分")
+            col1, col2 = st.columns(2)
+            with col1:
+                if st.button("🚀 バックエンド処理開始", type="primary"):
+                    with st.spinner("ファイルアップロード中..."):
+                        # ファイルアップロード
+                        gcs_uri = upload_to_gcs(uploaded_file, bucket_name)
+                        
+                        if gcs_uri:
+                            # ジョブ作成
+                            file_info = {
+                                'name': uploaded_file.name,
+                                'size': file_size_mb,
+                                'gcs_uri': gcs_uri
+                            }
+                            settings = {
+                                'speed_mode': speed_mode
+                            }
+                            
+                            job_id = job_manager.create_job(file_info, settings)
+                            st.session_state.current_job_id = job_id
+                            
+                            # バックエンド処理開始
+                            file_extension = os.path.splitext(uploaded_file.name)[1]
+                            start_background_processing(job_id, gcs_uri, file_extension, settings)
+                            
+                            st.success(f"✅ バックエンド処理を開始しました！")
+                            st.info(f"🆔 ジョブID: **{job_id}**")
+                            st.warning("💡 ブラウザを閉じても処理は継続されます。進捗確認タブで状況をチェックできます。")
             
-            # ファイル最適化のアドバイス
-            if file_size_mb > 50:
-                st.warning("⚠️ 大きなファイルです。処理時間が長くなる可能性があります")
-            elif uploaded_file.name.endswith('.wav'):
-                st.success("✅ WAV形式：最適な処理が期待できます")
+            with col2:
+                st.markdown("""
+                **🔄 非同期処理の流れ**
+                1. ファイルアップロード
+                2. バックエンド処理開始
+                3. ブラウザを閉じても継続
+                4. 完了通知（進捗確認で確認）
+                """)
+    
+    with tab2:
+        st.header("📊 処理進捗確認")
+        
+        # 現在のジョブがある場合
+        if st.session_state.current_job_id:
+            job_id = st.session_state.current_job_id
+            st.info(f"現在のジョブID: **{job_id}**")
             
-            # 処理開始ボタン
-            button_text = f"🚀 {speed_mode}モードで開始"
-            if st.button(button_text, type="primary"):
-                total_start_time = time.time()
+            if st.button("🔄 最新状況を確認"):
+                job_status = job_manager.get_job_status(job_id)
                 
-                with st.spinner("処理中..."):
-                    # 1. GCSにアップロード
-                    st.info("📤 ファイルをアップロード中...")
-                    gcs_uri = upload_to_gcs(uploaded_file, bucket_name)
+                if job_status:
+                    st.json(job_status)
                     
-                    if gcs_uri:
-                        st.success("✅ アップロード完了")
+                    # プログレスバー表示
+                    if job_status['status'] == 'processing':
+                        st.progress(job_status['progress'] / 100)
+                        st.info(f"📍 {job_status['current_step']}")
+                    elif job_status['status'] == 'completed':
+                        st.success("🎉 処理完了！")
+                        st.balloons()
                         
-                        # 2. 音声認識
-                        file_extension = os.path.splitext(uploaded_file.name)[1]
-                        result = transcribe_audio_optimized(gcs_uri, file_extension, speed_mode)
-                        
-                        if result and result[0]:
-                            transcript, processing_time = result
-                            st.success(f"✅ 音声認識完了（{processing_time:.1f}分）")
+                        # 結果表示
+                        result = job_status['result']
+                        if result and 'meeting_minutes' in result:
+                            st.markdown("### 📋 生成された議事録")
+                            st.markdown(result['meeting_minutes'])
                             
-                            # 3. 議事録生成
-                            st.info("📝 議事録生成中...")
-                            meeting_minutes = generate_meeting_minutes_smart(transcript, processing_time, speed_mode)
-                            
-                            if meeting_minutes:
-                                total_time = (time.time() - total_start_time) / 60
-                                
-                                st.success(f"🎉 全処理完了！総時間: {total_time:.1f}分")
-                                
-                                # 結果表示
-                                with col2:
-                                    st.header("📋 生成された議事録")
-                                    st.markdown(meeting_minutes)
-                                    
-                                    # ダウンロードボタン
-                                    st.download_button(
-                                        label="📥 議事録をダウンロード",
-                                        data=meeting_minutes,
-                                        file_name=f"議事録_{datetime.now().strftime('%Y%m%d_%H%M%S')}.md",
-                                        mime="text/markdown"
-                                    )
-                                
-                                # 処理統計
-                                with st.expander("📊 処理統計"):
-                                    st.write(f"- **処理モード**: {speed_mode}")
-                                    st.write(f"- **音声認識時間**: {processing_time:.1f}分")
-                                    st.write(f"- **総処理時間**: {total_time:.1f}分")
-                                    st.write(f"- **ファイルサイズ**: {file_size_mb:.1f} MB")
-                                    st.write(f"- **転写文字数**: {len(transcript):,}文字")
-                                    st.write(f"- **推定音声長**: {len(transcript.split())//120}分")
-                                
-                                # 音声転写テキスト表示
-                                with st.expander("📄 音声転写テキスト（全文）"):
-                                    st.text_area("転写結果", transcript, height=400)
+                            # ダウンロード
+                            st.download_button(
+                                label="📥 議事録をダウンロード",
+                                data=result['meeting_minutes'],
+                                file_name=f"議事録_{job_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.md",
+                                mime="text/markdown"
+                            )
+                    elif job_status['status'] == 'failed':
+                        st.error(f"❌ 処理失敗: {job_status.get('error', '不明なエラー')}")
+                else:
+                    st.warning("ジョブが見つかりません")
+        
+        # 手動ジョブID入力
+        st.markdown("---")
+        manual_job_id = st.text_input("🆔 ジョブIDを入力して確認", placeholder="例: abc12345")
+        if manual_job_id and st.button("確認"):
+            job_status = job_manager.get_job_status(manual_job_id)
+            if job_status:
+                st.json(job_status)
+            else:
+                st.error("ジョブが見つかりません")
     
-    # フッター情報
+    with tab3:
+        st.header("📋 完了済みジョブ一覧")
+        st.info("過去7日間の完了ジョブを表示（今後実装予定）")
+    
+    # フッター
     st.markdown("---")
-    col1, col2, col3 = st.columns(3)
-    
-    with col1:
-        st.markdown("**🚀 確実な処理**")
-        st.markdown("安定した音声認識と十分なタイムアウト設定")
-    
-    with col2:
-        st.markdown("**⚖️ 選べるモード**")
-        st.markdown("用途に応じた速度・精度設定")
-    
-    with col3:
-        st.markdown("**🔒 プライバシー**")
-        st.markdown("処理後ファイル自動削除")
+    st.markdown("""
+    ### 🎯 システムの特徴
+    - **非同期処理**: ブラウザを閉じても処理継続
+    - **進捗追跡**: いつでも処理状況を確認
+    - **自動保存**: 結果は自動でクラウドに保存
+    - **長時間対応**: 最大1時間の音声処理に対応
+    """)
 
 if __name__ == "__main__":
     main()

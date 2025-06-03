@@ -77,7 +77,7 @@ def transcribe_audio(gcs_uri, file_extension):
         operation = client.long_running_recognize(config=config, audio=audio)
         
         st.info("音声認識を実行中です... しばらくお待ちください")
-        response = operation.result(timeout=300)  # 5分でタイムアウト
+        response = operation.result(timeout=1800)  # 30分でタイムアウト
         
         # 結果を整理
         transcript = ""

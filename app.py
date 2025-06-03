@@ -23,8 +23,8 @@ def setup_google_credentials():
         st.error(f"Google Cloud認証に失敗しました: {e}")
         return False
 
-def split_audio_to_chunks(audio_file, chunk_size_mb=10):
-    """音声ファイルを指定サイズのチャンクに分割"""
+def split_audio_to_chunks(audio_file, chunk_size_mb=3):
+    """音声ファイルを指定サイズのチャンクに分割（小さめ）"""
     try:
         file_size_mb = audio_file.size / 1024 / 1024
         chunk_size_bytes = chunk_size_mb * 1024 * 1024
@@ -69,7 +69,7 @@ def upload_chunk_to_gcs(chunk_data, chunk_number, original_filename, bucket_name
         return None
 
 def transcribe_chunk(gcs_uri, file_extension, chunk_number, speed_mode):
-    """単一チャンクの音声認識"""
+    """単一チャンクの音声認識（小さなチャンク用）"""
     try:
         client = speech.SpeechClient()
         
@@ -85,47 +85,42 @@ def transcribe_chunk(gcs_uri, file_extension, chunk_number, speed_mode):
         
         audio = speech.RecognitionAudio(uri=gcs_uri)
         
-        # 速度モードに応じた設定
-        if speed_mode == "fast":
-            config = speech.RecognitionConfig(
-                encoding=encoding,
-                language_code="ja-JP",
-                model="default",
-                enable_automatic_punctuation=True,
-                enable_speaker_diarization=False,
-                use_enhanced=False
-            )
-        elif speed_mode == "quality":
-            config = speech.RecognitionConfig(
-                encoding=encoding,
-                language_code="ja-JP",
-                model="latest_long",
-                enable_automatic_punctuation=True,
-                enable_speaker_diarization=True,
-                diarization_speaker_count=2,
-                use_enhanced=True
-            )
-        else:  # balanced
-            config = speech.RecognitionConfig(
-                encoding=encoding,
-                language_code="ja-JP",
-                model="default",
-                enable_automatic_punctuation=True,
-                enable_speaker_diarization=False,
-                use_enhanced=False
-            )
+        # 速度モードに応じた設定（簡素化）
+        config = speech.RecognitionConfig(
+            encoding=encoding,
+            language_code="ja-JP",
+            model="default",
+            enable_automatic_punctuation=True,
+            enable_speaker_diarization=False,  # 小さなチャンクでは無効
+            use_enhanced=False,  # 高速化のため無効
+            max_alternatives=1
+        )
         
-        # 短時間チャンクなので同期認識を使用（高速）
-        response = client.recognize(config=config, audio=audio)
+        # 小さなチャンク（3MB以下）なので同期認識を試行
+        try:
+            response = client.recognize(config=config, audio=audio)
+        except Exception as sync_error:
+            # 同期認識が失敗した場合は非同期認識にフォールバック
+            st.warning(f"チャンク {chunk_number}: 非同期認識に切り替え")
+            operation = client.long_running_recognize(config=config, audio=audio)
+            
+            # 非同期認識の結果待機（最大5分）
+            start_time = time.time()
+            while not operation.done():
+                if time.time() - start_time > 300:  # 5分でタイムアウト
+                    return f"[チャンク {chunk_number}: タイムアウト]"
+                time.sleep(10)
+            
+            response = operation.result()
         
         transcript = ""
         for result in response.results:
             transcript += result.alternatives[0].transcript + " "
         
-        return transcript.strip()
+        return transcript.strip() if transcript.strip() else f"[チャンク {chunk_number}: 音声なし]"
     except Exception as e:
         st.error(f"チャンク {chunk_number} の音声認識に失敗: {e}")
-        return f"[チャンク {chunk_number}: 認識失敗]"
+        return f"[チャンク {chunk_number}: 認識失敗 - {str(e)[:50]}]"
 
 def process_chunks_sequentially(chunks, original_filename, bucket_name, speed_mode):
     """チャンクを順次処理（スリープ対応）"""
@@ -179,8 +174,32 @@ def process_chunks_sequentially(chunks, original_filename, bucket_name, speed_mo
         return None
 
 def generate_meeting_minutes(transcript, processing_time, speed_mode):
-    """議事録生成"""
+    """議事録生成（APIキーチェック付き）"""
     try:
+        # OpenAI APIキーの存在確認
+        if "OPENAI_API_KEY" not in st.secrets:
+            st.warning("⚠️ OpenAI APIキーが設定されていません。音声転写結果のみ表示します。")
+            return f"""
+# 🎤 音声転写結果
+
+## 📅 基本情報
+- 生成日時：{datetime.now().strftime("%Y年%m月%d日 %H:%M")}
+- 処理時間：{processing_time:.1f}分
+- 処理方式：チャンク分割処理
+- 品質モード：{speed_mode}
+
+## 📄 音声転写テキスト
+{transcript}
+
+---
+※OpenAI APIキーが設定されていないため、議事録の自動生成ができませんでした。
+上記の転写テキストを元に手動で議事録を作成してください。
+
+### 🔧 OpenAI APIキー設定方法
+1. https://platform.openai.com でAPIキーを取得
+2. Streamlit CloudのSecrets設定でOPENAI_API_KEYを追加
+"""
+        
         openai.api_key = st.secrets["OPENAI_API_KEY"]
         
         # 長いテキストの処理
@@ -252,7 +271,20 @@ def generate_meeting_minutes(transcript, processing_time, speed_mode):
         return response.choices[0].message.content
     except Exception as e:
         st.error(f"議事録生成に失敗しました: {e}")
-        return None
+        return f"""
+# 🎤 音声転写結果（議事録生成失敗）
+
+## 📅 基本情報
+- 生成日時：{datetime.now().strftime("%Y年%m月%d日 %H:%M")}
+- 処理時間：{processing_time:.1f}分
+- エラー：{str(e)}
+
+## 📄 音声転写テキスト
+{transcript}
+
+---
+※議事録の自動生成に失敗しました。上記の転写テキストを元に手動で議事録を作成してください。
+"""
 
 def main():
     st.set_page_config(
@@ -276,9 +308,9 @@ def main():
     
     chunk_size = st.sidebar.selectbox(
         "チャンクサイズ",
-        [5, 10, 15],
+        [2, 3, 5],
         index=1,
-        help="音声ファイルを指定サイズ(MB)で分割"
+        help="音声ファイルを指定サイズ(MB)で分割（小さいほど確実）"
     )
     
     speed_mode = st.sidebar.selectbox(

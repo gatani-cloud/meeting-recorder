@@ -46,20 +46,31 @@ def upload_to_gcs(audio_file, bucket_name):
         st.error(f"ファイルアップロードに失敗しました: {e}")
         return None
 
-def transcribe_audio(gcs_uri):
+def transcribe_audio(gcs_uri, file_extension):
     """Google Speech-to-Textで音声を文字起こし"""
     try:
         client = speech.SpeechClient()
         
+        # ファイル形式に応じたエンコーディング設定
+        encoding_map = {
+            '.wav': speech.RecognitionConfig.AudioEncoding.LINEAR16,
+            '.mp3': speech.RecognitionConfig.AudioEncoding.MP3,
+            '.m4a': speech.RecognitionConfig.AudioEncoding.MP3,  # M4Aは通常MP3として処理
+            '.flac': speech.RecognitionConfig.AudioEncoding.FLAC,
+        }
+        
+        encoding = encoding_map.get(file_extension.lower(), 
+                                  speech.RecognitionConfig.AudioEncoding.ENCODING_UNSPECIFIED)
+        
         audio = speech.RecognitionAudio(uri=gcs_uri)
         config = speech.RecognitionConfig(
-            encoding=speech.RecognitionConfig.AudioEncoding.ENCODING_UNSPECIFIED,
-            sample_rate_hertz=16000,
+            encoding=encoding,
             language_code="ja-JP",
             enable_automatic_punctuation=True,
             enable_speaker_diarization=True,
             diarization_speaker_count=2,
-            model="latest_long"
+            model="latest_long",
+            use_enhanced=True  # 音質向上
         )
         
         # 長時間音声の場合は非同期処理
@@ -180,7 +191,8 @@ def main():
                         
                         # 2. 音声認識
                         st.info("🎯 音声認識中...")
-                        transcript = transcribe_audio(gcs_uri)
+                        file_extension = os.path.splitext(uploaded_file.name)[1]
+                        transcript = transcribe_audio(gcs_uri, file_extension)
                         
                         if transcript:
                             st.success("✅ 音声認識完了")

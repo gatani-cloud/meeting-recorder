@@ -23,8 +23,8 @@ def setup_google_credentials():
         st.error(f"Google Cloud認証に失敗しました: {e}")
         return False
 
-def split_audio_to_chunks(audio_file, chunk_size_mb=3):
-    """音声ファイルを指定サイズのチャンクに分割（小さめ）"""
+def split_audio_to_chunks(audio_file, chunk_size_mb=1):
+    """音声ファイルを指定サイズのチャンクに分割（超小型）"""
     try:
         file_size_mb = audio_file.size / 1024 / 1024
         chunk_size_bytes = chunk_size_mb * 1024 * 1024
@@ -308,9 +308,9 @@ def main():
     
     chunk_size = st.sidebar.selectbox(
         "チャンクサイズ",
-        [2, 3, 5],
-        index=1,
-        help="音声ファイルを指定サイズ(MB)で分割（小さいほど確実）"
+        [1, 2, 3],
+        index=0,
+        help="音声ファイルを指定サイズ(MB)で分割（1MBが最も確実）"
     )
     
     speed_mode = st.sidebar.selectbox(
